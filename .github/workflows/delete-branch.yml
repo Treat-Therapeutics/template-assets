@@ -1,0 +1,60 @@
+# Deletes one branch of this repo on request. Why: Claude cloud sessions cannot delete a branch
+# (the git gateway answers HTTP 403 to `git push --delete`, measured Wed Nov 25 2026), and the
+# cloud's GitHub tools can start a workflow but have no delete-branch call. Jon, Wed Nov 25 2026:
+# "you must fix so the cloud can do this". Started by hand or from a session (workflow_dispatch).
+# Guards: the branch must still point at the commit the caller names (so nothing newer is lost),
+# and the default branch and the shared machinery branches are never deleted.
+name: delete-branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to delete (without refs/heads/)
+        required: true
+        type: string
+      expected_sha:
+        description: Full commit the branch must point at now; anything else refuses
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: delete-branch-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  delete-branch:
+    name: delete-branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the branch if it is safe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ inputs.branch }}
+          EXPECTED: ${{ inputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          case "$BRANCH" in
+            ""|"$DEFAULT_BRANCH"|main|master|test-line/lock|beads-dolt-data|refs/*)
+              echo "REFUSED: $BRANCH is protected by this workflow"; exit 1 ;;
+          esac
+          if ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "REFUSED: expected_sha must be a full 40-character commit"; exit 1
+          fi
+          enc=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$BRANCH")
+          now=$(gh api "repos/$REPO/git/ref/heads/$enc" --jq .object.sha 2>/dev/null || true)
+          if [ -z "$now" ]; then echo "REFUSED: branch $BRANCH not found"; exit 1; fi
+          if [ "$now" != "$EXPECTED" ]; then
+            echo "REFUSED: $BRANCH points at $now, not $EXPECTED"; exit 1
+          fi
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$enc"
+          if gh api "repos/$REPO/git/ref/heads/$enc" >/dev/null 2>&1; then
+            echo "FAILED: $BRANCH still exists after the delete"; exit 1
+          fi
+          echo "DELETED: $BRANCH (was $EXPECTED)"
